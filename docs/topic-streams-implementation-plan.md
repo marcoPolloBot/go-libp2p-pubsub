@@ -176,12 +176,13 @@ References are to files at the repo root unless noted.
    control stream. This keeps mesh/fanout/scoring logic untouched and confines
    the change to the wire layer. (See §4.3.)
 5. **Inbound synchronization & lifecycle (the subtle part).** Topic streams are
-   independent libp2p streams with their own lifetimes; they can open before or
-   outlive the control stream. Reconstructed topic-stream messages must rejoin
-   the normal ingestion path **without** being mistaken for control-stream
-   events (subscriptions, the "first RPC = extensions hello") and a topic-stream
-   close must **not** be treated as the peer's control stream closing. (See
-   §4.4 and §4.5.)
+   separate libp2p streams, but they are only meaningful within an **open
+   control stream**: a topic message is processed only while the peer's control
+   stream is open, and dropped otherwise. Reconstructed topic-stream messages
+   must rejoin the normal ingestion path **without** being mistaken for
+   control-stream events (subscriptions, the "first RPC = extensions hello"),
+   and a topic-stream close must **not** be treated as the peer's control stream
+   closing. (See §4.4 and §4.5.)
 6. **Partial-messages interplay.** When both extensions are on, partial RPCs
    ride the topic stream. With the agnostic design this falls out for free — the
    send layer routes `RPC.Partial` the same way it routes `Publish`.
@@ -328,6 +329,10 @@ reconstructed `*Message` (or a `Partial` + topic) and the source peer. In
 `processLoop` it routes to a slim ingestion path that does only what a
 topic-scoped message needs:
 
+- **Gate on an open control stream (required):** a topic message is only
+  meaningful within an open control stream for that peer, so first check that
+  the peer's control stream is currently open; if not, **drop** the message
+  (and reset its topic stream). See "Control-stream gating" below.
 - run `rt.AcceptFrom` (graylist/throttle vetting),
 - for a publish: the message half of `handleIncomingRPC` — our-own-subscription
   check (`subscribedToMsg`/`canRelayMsg`), `shouldPush`, `Preprocess`,
@@ -340,15 +345,33 @@ transport layer** (counters + scoring callbacks, below), not via the router's
 incoming-stream notifications — so a topic stream closing never disturbs
 control-stream state, and vice versa.
 
-**So: control stream closed, then a topic-stream RPC arrives?** It is delivered
-correctly. Inbound publish delivery depends on *our* subscription
-(`subscribedToMsg`), not the peer's cleared state, and the slim path does not
-touch the now-cleared `peerExtensions`/`p.topics[...][peer]`. The reverse —
-control stream alive, a single topic stream closes — leaves subscriptions and
-other topic streams untouched because topic-stream lifecycle never flows through
+**Control-stream gating.** Topic messages are processed **only while the peer's
+control stream is open**; if the control stream is closed we drop them. The
+open/closed status is authoritative on the `processLoop` thread, which already
+sees `incomingKindNewStream` / `incomingKindClosedStream` for the gossipsub
+(control) protocol. We track it with a per-peer flag/refcount
+(`controlStreamOpen map[peer.ID]…`) updated when those kinds are handled
+(filtered to the control protocol — the `/gsts/v0beta` handler does **not** emit
+these kinds). When handling `incomingKindTopicRPC`:
+
+- control stream open ⇒ run the slim path above;
+- control stream closed (or never opened) ⇒ drop the message and reset the
+  topic stream.
+
+Because both checks happen on the single `processLoop` thread, the decision is
+well-defined regardless of how the control and topic streams interleave on the
+`incoming` channel: if the control `ClosedStream` has already been processed,
+the flag is false and the topic message is dropped.
+
+**So: control stream closed, then a topic-stream RPC arrives?** The topic
+message is **dropped** (per the gate above). When the control stream closes we
+also proactively tear down that peer's inbound and outbound topic streams (see
+§4.7), so no orphaned topic streams keep feeding messages. The reverse — control
+stream alive, a single topic stream closes — leaves subscriptions and other
+topic streams untouched, because topic-stream lifecycle never flows through
 `onClosedIncomingStream`. (If the *connection* drops, all its streams — control
 and topic — fail together; the existing `handleDeadPeers` peer teardown plus the
-transport layer’s per-stream cleanup both run.)
+transport layer's per-stream cleanup both run.)
 
 **Limits, scoring, ordering** (in the transport layer / via a score callback):
 
@@ -384,9 +407,11 @@ router only emits intents the writer already sees.
   unsubscribe/leave signals can be delivered to the writer via the same
   per-peer `peerTransport` (e.g. a small command channel) so the router need
   only continue calling `Leave`/processing unsubscribes as today.
-- **Teardown** all topic streams to a peer when the control stream / connection
-  drops (`extensionsOnClosedOutboundStream`, `handleDeadPeers`) and on
-  blacklist.
+- **Teardown** all topic streams to a peer (inbound and outbound) when the
+  control stream closes (`onClosedIncomingStream` /
+  `extensionsOnClosedOutboundStream`), when the connection drops
+  (`handleDeadPeers`), and on blacklist. After the control stream closes, any
+  further inbound topic messages are dropped by the §4.5 gate.
 - **Scoring** reuses `reportMisbehavior` / the score subsystem for: responder
   writing on a topic stream, > 3 concurrent inbound streams per topic, and
   unsubscribed-topic streams (outside the grace window).
@@ -449,6 +474,10 @@ router only emits intents the writer already sees.
   falls back to control-stream `Message`s; no regression in existing tests.
 - **Partial + topic streams:** combined negotiation routes partials on the
   topic stream with `topicID` omitted/restored.
+- **Control-stream gating:** after the control stream closes, topic-stream
+  messages from that peer are dropped (not delivered to subscribers) and the
+  peer's topic streams are torn down; messages on a topic stream while the
+  control stream is open are delivered normally.
 - **Lifecycle/misbehavior:** responder writes ⇒ connection closed; > 3 streams
   per topic ⇒ downscore; unsubscribed-topic stream ⇒ downscore (and *not*
   within the unsubscribe grace window); stream closed on unsubscribe/leave.
