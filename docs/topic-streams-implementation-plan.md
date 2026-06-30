@@ -326,8 +326,11 @@ semantics that are wrong for topic streams:
 
 **Design:** add one dedicated kind, `incomingKindTopicRPC`, carrying the
 reconstructed `*Message` (or a `Partial` + topic) and the source peer. In
-`processLoop` it routes to a slim ingestion path that does only what a
-topic-scoped message needs:
+`processLoop` it routes to a slim ingestion path — a new **PubSub-level** helper
+(a trimmed `handleIncomingRPC`), *not* a change to `GossipSubRouter`. It reuses
+the existing router-interface methods (`AcceptFrom`, `Preprocess`, and the
+normal `pushMsg` → validate → `rt.Publish` forwarding path); the router's
+routing logic is untouched. It does only what a topic-scoped message needs:
 
 - **Gate on an open control stream (required):** a topic message is only
   meaningful within an open control stream for that peer, so first check that
@@ -378,8 +381,14 @@ transport layer's per-stream cleanup both run.)
 - Track concurrent inbound streams per `(peer, topic)`; if > 3, downscore
   (`reportMisbehavior`) and reset the offending stream.
 - If `topic` is not in our subscriptions **and** not recently unsubscribed,
-  downscore. Keep a small TTL set of recently-unsubscribed topics to honor the
-  unsubscribe-race grace the spec requires.
+  downscore. This is implemented as a **general PubSub-level rule**, not a
+  topic-streams-only one: today `handleIncomingRPC` (`pubsub.go`) *silently
+  ignores* a publish for an unsubscribed topic; we factor a shared helper
+  (backed by a `recentlyUnsubscribed` TTL set recorded in
+  `handleRemoveSubscription`) and apply it to both the control-stream publish
+  path and the topic-stream path. The TTL set honors the unsubscribe-race grace
+  the spec requires. (Behavior change for the normal path — silently-ignore →
+  downscore — so keep it conservative and consistent with `score.go`.)
 - A single reader goroutine per stream preserves per-stream receive order; the
   spec's "process multiple streams for a topic in receive order" is an explicit
   open item (see §7) since the shared `incoming` channel only loosely orders
@@ -414,7 +423,8 @@ router only emits intents the writer already sees.
   further inbound topic messages are dropped by the §4.5 gate.
 - **Scoring** reuses `reportMisbehavior` / the score subsystem for: responder
   writing on a topic stream, > 3 concurrent inbound streams per topic, and
-  unsubscribed-topic streams (outside the grace window).
+  unsubscribed-topic publishes (outside the grace window — via the shared
+  general rule above, applied to both control-stream and topic-stream publishes).
 - **Resource limits**: ensure topic streams respect libp2p resource-manager
   scopes; cap total outbound topic streams per peer.
 
