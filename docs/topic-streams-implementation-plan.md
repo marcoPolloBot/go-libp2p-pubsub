@@ -332,10 +332,11 @@ the existing router-interface methods (`AcceptFrom`, `Preprocess`, and the
 normal `pushMsg` → validate → `rt.Publish` forwarding path); the router's
 routing logic is untouched. It does only what a topic-scoped message needs:
 
-- **Gate on an open control stream (required):** a topic message is only
-  meaningful within an open control stream for that peer, so first check that
-  the peer's control stream is currently open; if not, **drop** the message
-  (and reset its topic stream). See "Control-stream gating" below.
+- **Gate on the control stream (3 states):** a topic message is only meaningful
+  once the peer's control-stream hello (which MUST carry the extensions control
+  message) has been applied. Depending on control-stream state we either run the
+  slim path, **buffer one** message, or **drop**. See "Control-stream gating"
+  below.
 - run `rt.AcceptFrom` (graylist/throttle vetting),
 - for a publish: the message half of `handleIncomingRPC` — our-own-subscription
   check (`subscribedToMsg`/`canRelayMsg`), `shouldPush`, `Preprocess`,
@@ -348,23 +349,32 @@ transport layer** (counters + scoring callbacks, below), not via the router's
 incoming-stream notifications — so a topic stream closing never disturbs
 control-stream state, and vice versa.
 
-**Control-stream gating.** Topic messages are processed **only while the peer's
-control stream is open**; if the control stream is closed we drop them. The
-open/closed status is authoritative on the `processLoop` thread, which already
-sees `incomingKindNewStream` / `incomingKindClosedStream` for the gossipsub
-(control) protocol. We track it with a per-peer flag/refcount
-(`controlStreamOpen map[peer.ID]…`) updated when those kinds are handled
-(filtered to the control protocol — the `/gsts/v0beta` handler does **not** emit
-these kinds). When handling `incomingKindTopicRPC`:
+**Control-stream gating (3 states).** The extensions control message MUST be
+first: a topic message is only meaningful once we have applied the peer's
+control-stream hello (gossipsub v1.3 requires the extensions control message in
+the first control RPC). The control-stream reader delivers RPCs in order, so the
+hello is the first control RPC `processLoop` sees for a peer. We keep per-peer,
+`processLoop`-owned state — `controlStreamOpen` (set/cleared from
+`incomingKindNewStream` / `incomingKindClosedStream` for the control protocol;
+the `/gsts/v0beta` handler does **not** emit those kinds), `controlHelloSeen`
+(set when the first control RPC is processed — also when `peerExtensions[peer]`
+is recorded), and a **single-slot** `pendingTopicRPC[peer]`.
 
-- control stream open ⇒ run the slim path above;
-- control stream closed (or never opened) ⇒ drop the message and reset the
-  topic stream.
+When handling `incomingKindTopicRPC`:
 
-Because both checks happen on the single `processLoop` thread, the decision is
-well-defined regardless of how the control and topic streams interleave on the
-`incoming` channel: if the control `ClosedStream` has already been processed,
-the flag is false and the topic message is dropped.
+- **control stream closed / torn down** ⇒ drop the message and reset the topic
+  stream;
+- **open but hello not yet applied** ⇒ buffer this message in `pendingTopicRPC`
+  if the slot is free; otherwise drop it (**at most one** buffered per peer);
+- **hello applied** ⇒ run the slim path above.
+
+When the control hello is applied we set `controlHelloSeen` and immediately
+flush any `pendingTopicRPC` through the slim path. This delivers the extensions
+control message before any topic message while tolerating the rare reorder where
+a topic frame reaches us just ahead of the hello (instead of dropping a
+legitimate first message). Because every transition happens on the single
+`processLoop` thread, the outcome is well-defined regardless of how the control
+and topic streams interleave on the `incoming` channel.
 
 **So: control stream closed, then a topic-stream RPC arrives?** The topic
 message is **dropped** (per the gate above). When the control stream closes we
@@ -488,6 +498,10 @@ router only emits intents the writer already sees.
   messages from that peer are dropped (not delivered to subscribers) and the
   peer's topic streams are torn down; messages on a topic stream while the
   control stream is open are delivered normally.
+- **Hello-ordering race:** a topic frame that arrives just before the control
+  hello is buffered (at most one) and delivered after the hello is applied; a
+  second early frame is dropped; the extensions control message is always
+  applied first.
 - **Lifecycle/misbehavior:** responder writes ⇒ connection closed; > 3 streams
   per topic ⇒ downscore; unsubscribed-topic stream ⇒ downscore (and *not*
   within the unsubscribe grace window); stream closed on unsubscribe/leave.
