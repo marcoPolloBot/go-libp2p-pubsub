@@ -175,14 +175,16 @@ References are to files at the repo root unless noted.
    control traffic (subs, IHAVE/IWANT/GRAFT/PRUNE/IDONTWANT, extensions) on the
    control stream. This keeps mesh/fanout/scoring logic untouched and confines
    the change to the wire layer. (See §4.3.)
-5. **Inbound synchronization & lifecycle (the subtle part).** Topic streams are
-   separate libp2p streams, but they are only meaningful within an **open
-   control stream**: a topic message is processed only while the peer's control
-   stream is open, and dropped otherwise. Reconstructed topic-stream messages
-   must rejoin the normal ingestion path **without** being mistaken for
-   control-stream events (subscriptions, the "first RPC = extensions hello"),
-   and a topic-stream close must **not** be treated as the peer's control stream
-   closing. (See §4.4 and §4.5.)
+5. **Inbound ordering (kept in `comm.go`).** Topic messages are delivered as
+   ordinary `incomingKindRPC`, so `pubsub.go`'s `processLoop` /
+   `handleIncomingRPC` machinery does not change. Correctness reduces to
+   **ordering**: the peer's control-stream hello (which MUST carry the extensions
+   control message) must be enqueued before any topic message, else
+   `extensions.HandleRPC` would mistake a topic RPC for the "first RPC = hello".
+   `comm.go` enforces this by buffering at most one topic frame until the hello
+   is enqueued, and by dropping topic messages once the control stream is closed.
+   A topic-stream close must **not** be treated as the control stream closing.
+   (See §4.4 and §4.5.)
 6. **Partial-messages interplay.** When both extensions are on, partial RPCs
    ride the topic stream. With the agnostic design this falls out for free — the
    send layer routes `RPC.Partial` the same way it routes `Publish`.
@@ -280,110 +282,80 @@ mutable router state is introduced.
 Helpers `messageToTopicScoped` / `topicScopedToMessage` live in the transport
 layer (§4.1).
 
-### 4.4 Inbound: `/gsts/v0beta` handler
+### 4.4 Inbound: `/gsts/v0beta` handler (in `comm.go`)
 
-Register a dedicated handler in the constructor (`pubsub.go`) — separate from
-`handleNewStream`. Per stream the handler:
+A dedicated reader, living in `comm.go` (registered as a stream handler for
+`/gsts/v0beta`, separate from `handleNewStream`), handles each inbound topic
+stream:
 
-1. Reads the first frame as `TopicRPCHeader`; extracts `topic`.
-2. Loops reading `TopicRPC` frames. For each:
-   - `publish` → `topicScopedToMessage(ts, topic)` (reconstruct the full
-     `Message` with topic so the signature verifies, per the spec).
-   - `partial` → set `partial.TopicID = topic`.
-   Then hand the reconstructed content to the ingestion path described in §4.5.
+1. Read the first frame as `TopicRPCHeader`; extract `topic`.
+2. Loop reading `TopicRPC` frames; reconstruct an **ordinary** `RPC`:
+   - `publish` → `topicScopedToMessage(ts, topic)` → `RPC{Publish: [m], from: peer}`
+     (full `Message` with topic, so the signature verifies, per the spec);
+   - `partial` → set `partial.TopicID = topic` → `RPC{Partial: partial, from: peer}`.
+3. Push it onto `PubSub.incoming` as an ordinary **`incomingKindRPC`** — the same
+   kind the control-stream reader already uses — subject to the ordering rule in
+   §4.5.
 
-### 4.5 Inbound synchronization with the existing `incoming` kinds
+Because topic messages arrive as a normal `incomingKindRPC`, the `processLoop` /
+`incomingUnion` / `handleIncomingRPC` machinery in `pubsub.go` does **not**
+change. `handleIncomingRPC` validates and forwards the publish exactly as for a
+control-stream message, and a reconstructed `RPC{Partial}` routes through the
+existing `rt.HandleRPC → extensions.HandleRPC → partialMessagesExtension` path.
+No new incoming kind and no separate ingestion path are introduced.
 
-> This addresses: *how does this synchronize with the existing `incomingUnion`
-> kinds, and what happens if the control stream is closed but we receive a
-> topic-stream RPC?*
+### 4.5 Inbound ordering: the hello comes first — all in `comm.go`
 
-**The single channel keeps things race-free, but only that.** Everything still
-funnels through the one `PubSub.incoming` channel, drained one item at a time by
-`processLoop`. So no matter how many topic streams a peer opens, there is never
-concurrent mutation of router state — that property is preserved for free. What
-the channel does **not** give us is cross-stream ordering: control stream and
-each topic stream are separate reader goroutines, so their sends interleave
-arbitrarily (only per-stream FIFO holds). The design must therefore be correct
-regardless of interleaving.
+> Addresses: the extensions control message MUST be applied before any topic
+> message, and topic messages must be dropped once the control stream is closed.
+> All of this is enforced in `comm.go`; `pubsub.go` does not change.
 
-**Topic-stream messages must NOT reuse `incomingKindRPC` / `incomingKindNewStream`
-/ `incomingKindClosedStream` as-is.** Those kinds carry control-stream
-semantics that are wrong for topic streams:
+**Why ordering is the whole game.** Delivering topic messages as ordinary
+`incomingKindRPC` is correct **iff** the peer's control-stream hello is processed
+before any of its topic messages. The hello MUST carry the extensions control
+message (gossipsub v1.3); if a reconstructed topic RPC reached `handleIncomingRPC`
+first, `rt.HandleRPC → extensions.HandleRPC` would hit the "first RPC from this
+peer ⇒ extensions hello" branch (`extensions.go`) and corrupt
+`peerExtensions[peer]`. Conversely, once the hello has been processed,
+`peerExtensions[peer]` is set, the misfire is impossible, the reconstructed RPC
+carries no subscriptions/extensions (so those code paths are no-ops), and a
+`Partial` routes correctly through the existing extensions handler.
 
-- `incomingKindClosedStream` → `onClosedIncomingStream` calls
-  `clearPeerFromTopicsState(pid)` (`pubsub.go`), which wipes **all** of the
-  peer's subscription state and emits `PeerLeave` events, and
-  `rt.OnClosedIncomingStream` deletes `peerExtensions[pid]`. Routing a *topic*
-  stream's close through this would tear down the peer's subscriptions and
-  extension state even though the control stream and other topic streams are
-  still alive.
-- `incomingKindRPC` → `handleIncomingRPC` processes subscriptions and calls
-  `rt.HandleRPC` → `extensions.HandleRPC`, whose "first RPC from this peer ⇒
-  treat as the extensions hello" branch (`extensions.go`) would misfire for a
-  reconstructed topic message — especially right after a control-stream close
-  cleared `peerExtensions[pid]`.
+`PubSub.incoming` is FIFO and single-consumer, so **enqueue order = process
+order**. It is therefore enough for `comm.go` to *enqueue* the hello before any
+topic message — no `processLoop` changes, no extra incoming kind, no buffer in
+`pubsub.go`.
 
-**Design:** add one dedicated kind, `incomingKindTopicRPC`, carrying the
-reconstructed `*Message` (or a `Partial` + topic) and the source peer. In
-`processLoop` it routes to a slim ingestion path — a new **PubSub-level** helper
-(a trimmed `handleIncomingRPC`), *not* a change to `GossipSubRouter`. It reuses
-the existing router-interface methods (`AcceptFrom`, `Preprocess`, and the
-normal `pushMsg` → validate → `rt.Publish` forwarding path); the router's
-routing logic is untouched. It does only what a topic-scoped message needs:
+**Coordination (in `comm.go`).** A small per-peer object (e.g.
+`helloEnqueued chan struct{}` plus a `closed` flag) ties the two inbound readers
+together:
 
-- **Gate on the control stream (3 states):** a topic message is only meaningful
-  once the peer's control-stream hello (which MUST carry the extensions control
-  message) has been applied. Depending on control-stream state we either run the
-  slim path, **buffer one** message, or **drop**. See "Control-stream gating"
-  below.
-- run `rt.AcceptFrom` (graylist/throttle vetting),
-- for a publish: the message half of `handleIncomingRPC` — our-own-subscription
-  check (`subscribedToMsg`/`canRelayMsg`), `shouldPush`, `Preprocess`,
-  `pushMsg` (validation, signature verify with topic present, forward),
-- for a partial: hand directly to `partialMessagesExtension.HandleRPC`.
+- The control-stream reader (`handleNewStream`) closes `helloEnqueued`
+  immediately after it enqueues the peer's first control RPC (the hello).
+- The topic-stream reader, after reading its first `TopicRPC`, **buffers that one
+  frame** and `select`s on `helloEnqueued` / `closed` / `ctx` before enqueuing.
+  At most one frame is buffered, because the reader blocks before reading the
+  next. Once the hello is enqueued it pushes the buffered frame, then streams the
+  rest normally.
 
-It deliberately skips subscription processing, the extensions-hello logic, and
-the generic `rt.HandleRPC`. Topic-stream open/close are handled **inside the
-transport layer** (counters + scoring callbacks, below), not via the router's
-incoming-stream notifications — so a topic stream closing never disturbs
-control-stream state, and vice versa.
+So the three cases are handled entirely in `comm.go`:
 
-**Control-stream gating (3 states).** The extensions control message MUST be
-first: a topic message is only meaningful once we have applied the peer's
-control-stream hello (gossipsub v1.3 requires the extensions control message in
-the first control RPC). The control-stream reader delivers RPCs in order, so the
-hello is the first control RPC `processLoop` sees for a peer. We keep per-peer,
-`processLoop`-owned state — `controlStreamOpen` (set/cleared from
-`incomingKindNewStream` / `incomingKindClosedStream` for the control protocol;
-the `/gsts/v0beta` handler does **not** emit those kinds), `controlHelloSeen`
-(set when the first control RPC is processed — also when `peerExtensions[peer]`
-is recorded), and a **single-slot** `pendingTopicRPC[peer]`.
+- **hello not yet enqueued** ⇒ hold one frame, deliver it right after the hello;
+- **control stream closed / torn down** ⇒ drop the buffered frame, reset the
+  topic stream, and stop reading. The control reader marks `closed` before it
+  enqueues its `ClosedStream`, and the topic reader checks `closed` before each
+  enqueue, so `processLoop` never sees a topic RPC after the control
+  `ClosedStream` — i.e. "drop topic messages once the control stream is closed",
+  enforced in `comm.go`;
+- **hello applied, stream open** ⇒ enqueue normally.
 
-When handling `incomingKindTopicRPC`:
-
-- **control stream closed / torn down** ⇒ drop the message and reset the topic
-  stream;
-- **open but hello not yet applied** ⇒ buffer this message in `pendingTopicRPC`
-  if the slot is free; otherwise drop it (**at most one** buffered per peer);
-- **hello applied** ⇒ run the slim path above.
-
-When the control hello is applied we set `controlHelloSeen` and immediately
-flush any `pendingTopicRPC` through the slim path. This delivers the extensions
-control message before any topic message while tolerating the rare reorder where
-a topic frame reaches us just ahead of the hello (instead of dropping a
-legitimate first message). Because every transition happens on the single
-`processLoop` thread, the outcome is well-defined regardless of how the control
-and topic streams interleave on the `incoming` channel.
-
-**So: control stream closed, then a topic-stream RPC arrives?** The topic
-message is **dropped** (per the gate above). When the control stream closes we
-also proactively tear down that peer's inbound and outbound topic streams (see
-§4.7), so no orphaned topic streams keep feeding messages. The reverse — control
-stream alive, a single topic stream closes — leaves subscriptions and other
-topic streams untouched, because topic-stream lifecycle never flows through
-`onClosedIncomingStream`. (If the *connection* drops, all its streams — control
-and topic — fail together; the existing `handleDeadPeers` peer teardown plus the
+**Topic-stream lifecycle never uses the control-stream notifications.** The
+`/gsts/v0beta` reader must **not** emit `incomingKindNewStream` /
+`incomingKindClosedStream` — those drive `onClosedIncomingStream` →
+`clearPeerFromTopicsState` (`pubsub.go`), which would wipe the peer's
+subscriptions and `peerExtensions`. A topic stream closing therefore never
+disturbs control-stream state, and vice versa. (If the *connection* drops, all
+its streams fail together; the existing `handleDeadPeers` teardown plus the
 transport layer's per-stream cleanup both run.)
 
 **Limits, scoring, ordering** (in the transport layer / via a score callback):
@@ -410,8 +382,10 @@ With the agnostic send path (§4.3), no extra wiring is needed:
 `partialMessageRouter.SendRPC` (`extensions.go`) keeps doing
 `gs.sendRPC(RPC{Partial: …})`, and the `comm.go` writer routes that `Partial`
 onto the topic stream (clearing `topicID` on the wire) just like a `Publish`.
-Inbound, the §4.4 handler repopulates `Partial.TopicID` from the header before
-the slim path hands it to `partialMessagesExtension.HandleRPC`.
+Inbound, the §4.4 handler repopulates `Partial.TopicID` from the header and
+pushes an ordinary `RPC{Partial}`, which the unchanged
+`handleIncomingRPC → rt.HandleRPC → extensions.HandleRPC` path hands to
+`partialMessagesExtension.HandleRPC`.
 
 ### 4.7 Lifecycle, limits, scoring
 
@@ -430,7 +404,8 @@ router only emits intents the writer already sees.
   control stream closes (`onClosedIncomingStream` /
   `extensionsOnClosedOutboundStream`), when the connection drops
   (`handleDeadPeers`), and on blacklist. After the control stream closes, any
-  further inbound topic messages are dropped by the §4.5 gate.
+  further inbound topic messages are dropped by the §4.5 control-stream check
+  (enforced in `comm.go`).
 - **Scoring** reuses `reportMisbehavior` / the score subsystem for: responder
   writing on a topic stream, > 3 concurrent inbound streams per topic, and
   unsubscribed-topic publishes (outside the grace window — via the shared
@@ -460,16 +435,18 @@ router only emits intents the writer already sees.
    topic streams vs control traffic on the control stream, responder-write
    guard, `peerTransport` + atomic negotiation flag set from
    `extensionsOnNewOutboundStream`. **No changes to `gossipsub.go` routing.**
-4. **Inbound `/gsts/v0beta` handler + `incomingKindTopicRPC`.** Header state
-   machine, message/partial reconstruction, slim ingestion path that skips
-   subscription + extensions-hello logic, per-topic limits + downscoring +
-   unsubscribe grace.
+4. **Inbound `/gsts/v0beta` reader (in `comm.go`).** Header state machine,
+   message/partial reconstruction, push as ordinary `incomingKindRPC`; enforce
+   hello-before-topic ordering and control-stream-closed dropping in `comm.go`
+   (per-peer `helloEnqueued`/`closed`, buffer at most one). No `pubsub.go`
+   machinery change; per-topic limits + downscoring handled in the transport
+   layer.
 5. **Verify the split.** Confirm the control stream no longer carries `Message`
    for negotiated peers and that all existing routing tests still pass
    unchanged (since the router is untouched).
 6. **Lifecycle polish + scoring.** Mesh/fanout-only retention, short-lived
    `IWANT` streams, score penalties, resource caps.
-8. **Tests + docs.** Integration tests, backwards-compat, and a short
+7. **Tests + docs.** Integration tests, backwards-compat, and a short
    `README`/doc note. Optionally update `extensions/extensions.proto` registry
    upstream.
 
