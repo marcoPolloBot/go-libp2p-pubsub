@@ -165,17 +165,27 @@ References are to files at the repo root unless noted.
    header-then-body state machine.
 3. **Concurrency model.** Router state (`mesh`, `fanout`, `peers`,
    `extensions`) is single-threaded via `processLoop`/`eval`. Per-stream writer
-   goroutines must not touch that state directly; the topic-stream manager's
-   bookkeeping must either live behind `eval` or be a self-contained,
-   independently-locked component fed by the router.
-4. **Routing split.** `rpcs`/`Publish` must send full messages to the topic
-   stream for negotiated peers and keep using the control stream for everyone
-   else. Control traffic (subs, IHAVE/IWANT/GRAFT/PRUNE/IDONTWANT, extensions)
-   always stays on the control stream.
-5. **Partial-messages interplay.** When both extensions are on, partial RPCs
-   move to the topic stream. The combination must be explicitly handled (the
-   spec calls this out).
-6. **Lifecycle + scoring.** Open/close rules, the ≤3-streams-per-topic limit,
+   goroutines must not touch that state directly; topic-stream bookkeeping must
+   be self-contained and independently locked.
+4. **Keep the router transport-agnostic.** Topic streams are a *transport*
+   optimization, not a routing decision. The router (`gossipsub.go`) should keep
+   producing normal `RPC`s and calling `sendRPC` exactly as today; the
+   `comm.go` send layer should transparently peel topic-scoped content
+   (`Publish` messages, `Partial`) onto the right `/gsts/v0beta` stream and leave
+   control traffic (subs, IHAVE/IWANT/GRAFT/PRUNE/IDONTWANT, extensions) on the
+   control stream. This keeps mesh/fanout/scoring logic untouched and confines
+   the change to the wire layer. (See §4.3.)
+5. **Inbound synchronization & lifecycle (the subtle part).** Topic streams are
+   independent libp2p streams with their own lifetimes; they can open before or
+   outlive the control stream. Reconstructed topic-stream messages must rejoin
+   the normal ingestion path **without** being mistaken for control-stream
+   events (subscriptions, the "first RPC = extensions hello") and a topic-stream
+   close must **not** be treated as the peer's control stream closing. (See
+   §4.4 and §4.5.)
+6. **Partial-messages interplay.** When both extensions are on, partial RPCs
+   ride the topic stream. With the agnostic design this falls out for free — the
+   send layer routes `RPC.Partial` the same way it routes `Publish`.
+7. **Lifecycle + scoring.** Open/close rules, the ≤3-streams-per-topic limit,
    downscoring of unsubscribed-topic streams (with an unsubscribe grace
    window), and the responder-must-not-write rule.
 
@@ -203,109 +213,180 @@ Helpers (new, e.g. `topicstreams.go`):
 - Add `TopicStreams bool` to `PeerExtensions`; wire into
   `peerExtensionsFromRPC` and `ExtendRPC` (`extensions.go`).
 - Add `WithTopicStreams(...)` option setting
-  `myExtensions.TopicStreams = true` and installing the topic-stream manager on
-  the router (mirroring `WithPartialMessagesExtension`).
+  `myExtensions.TopicStreams = true` (mirroring `WithTestExtension`); it enables
+  the transport-layer behavior in §4.3 rather than installing anything on the
+  router.
 - Gate everything on `GossipSubFeatureExtensions` (v1.3) like the other
   extensions.
 - Drive activation/teardown from `extensionsOnNewOutboundStream` /
   `extensionsOnClosedOutboundStream`: when both sides advertise `topicStreams`,
-  mark the peer topic-stream-capable; on close, tear down all per-topic streams
-  to that peer.
+  flip the peer's `peerTransport.topicStreamsEnabled` flag (§4.3); on close,
+  tear down all per-topic streams to that peer.
 
-### 4.3 Outbound: `topicStreamManager`
+### 4.3 Outbound: transparent multiplexing in `comm.go` (router stays agnostic)
 
-A new component (initialized in `Attach`, given the `host`, the router, and a
-`sendonTopicStream` entry point) that maintains:
+**The router does not change.** `Publish` / `rpcs` / `sendRPC` keep building
+normal `RPC`s and enqueueing them onto the peer's single `*rpcQueue`
+(`PubSub.peers[pid]`) exactly as today. Topic-stream routing is pushed entirely
+into the per-peer send path in `comm.go`, so gossipsub's mesh/fanout/scoring
+logic never learns that topic streams exist.
 
-```
-map[peer.ID]map[string]*outboundTopicStream   // (peer, topic) -> stream
-```
+Today the per-peer writer is `handleSendingMessages` (`comm.go`), which drains
+the queue and writes each `RPC` to the one control stream. We turn it into a
+small per-peer **stream set** that owns:
 
-Per stream: a `network.Stream` (`/gsts/v0beta`), a bounded queue, and a writer
-goroutine (modeled on `handleSendingMessages` in `comm.go`) that:
+- the control stream (as today), and
+- a lazily-created `map[string]*outboundTopicStream` keyed by topic, each a
+  `/gsts/v0beta` stream with a header-first writer.
 
-1. writes the length-prefixed `TopicRPCHeader{topic}` first, then
-2. writes length-prefixed `TopicRPC` frames.
+For every dequeued `RPC` the writer decides, per piece, where bytes go:
 
-API used by the router:
+- **Topic streams disabled for this peer** (peer is pre-v1.3, or the
+  `topicStreams` extension was not mutually negotiated): write the whole `RPC`
+  on the control stream — current behavior, zero change.
+- **Topic streams enabled:**
+  - For each `msg` in `rpc.Publish`: open/lookup the stream for `msg.Topic`
+    (sending `TopicRPCHeader{topic}` first), then write
+    `TopicRPC{publish: messageToTopicScoped(msg)}` (topic omitted on the wire).
+  - If `rpc.Partial` is set: route it to the stream for `rpc.Partial.TopicID` as
+    `TopicRPC{partial: …}` with `topicID` cleared on the wire.
+  - Write whatever remains (`Subscriptions`, `Control`) on the control stream.
 
-- `SendMessage(p, topic, *pb.Message)` — lazily opens the stream (header on
-  first send), enqueues `TopicRPC{publish: messageToTopicScoped(msg)}`.
-- `SendPartial(p, topic, *pb.PartialMessagesExtension)` — enqueues
-  `TopicRPC{partial: …}` with `topicID` cleared on the wire.
-- `CloseTopic(p, topic)` / `CloseAll(p)` — lifecycle.
-- A short-lived variant for `IWANT` responses (open, send, close) per the
-  spec's MAY.
+This means the *same* `RPC{Publish:…}` the router produces today is split by the
+writer at send time; there is no new router API and no `SendMessage`/
+`SendPartial` call sites in `gossipsub.go`.
 
-The initiator also runs a tiny reader on each outbound stream to enforce
-"responder MUST NOT write": any byte read ⇒ log + close the connection (treat
-as protocol violation), analogous to `handlePeerDead` (`comm.go`).
+**How the writer learns negotiation state.** Negotiation completes on the
+`processLoop`/`eval` thread inside `extensionsState` (both sides advertised
+`topicStreams`). We give each peer a small shared `peerTransport` struct created
+when the peer is added; it holds an atomic `topicStreamsEnabled` flag (plus the
+host handle needed to open streams). `extensionsOnNewOutboundStream` flips the
+flag once; the writer reads it per `RPC`. The flag is written exactly once by
+the eval thread and only read by the writer, so an atomic bool is sufficient and
+race-free. Until it flips, everything stays on the control stream — which is
+correct, because the spec guarantees the extensions message precedes any publish
+(§Negotiation), so no topic message can be enqueued before negotiation is known.
 
-Concurrency: the manager owns its own mutex; it never touches router maps
-directly. The router calls into it from `processLoop`/`eval` (single-threaded),
-and writer goroutines only touch their own stream + queue.
+**Responder-must-not-write guard.** Each outbound topic stream also gets a tiny
+reader goroutine: any byte read from it is a protocol violation, so we log and
+close the connection (analogous to `handlePeerDead` in `comm.go`).
+
+**Concurrency.** The `peerTransport` and its topic-stream map are owned by the
+peer's writer goroutine (plus the one atomic flag set by eval). The writer never
+touches router maps; the router never touches transport maps. No new shared
+mutable router state is introduced.
+
+Helpers `messageToTopicScoped` / `topicScopedToMessage` live in the transport
+layer (§4.1).
 
 ### 4.4 Inbound: `/gsts/v0beta` handler
 
 Register a dedicated handler in the constructor (`pubsub.go`) — separate from
-`handleNewStream`. The handler:
+`handleNewStream`. Per stream the handler:
 
 1. Reads the first frame as `TopicRPCHeader`; extracts `topic`.
 2. Loops reading `TopicRPC` frames. For each:
-   - `publish` → `topicScopedToMessage(ts, topic)`, wrap into
-     `RPC{Publish: []*Message{m}, from: peer}`, push
-     `incomingUnion{kind: incomingKindRPC}` onto `PubSub.incoming`. This reuses
-     the existing validation/forwarding pipeline unchanged
-     (`handleIncomingRPC` → `pushMsg` → signature verify with topic present).
-   - `partial` → set `partial.TopicID = topic`, route to the partial extension
-     (via the same `incoming`/`HandleRPC` path used today, wrapping
-     `RPC{Partial: …}`).
-3. Enforces limits via `eval`/router callbacks:
-   - Track concurrent inbound streams per `(peer, topic)`; if > 3, downscore
-     (`reportMisbehavior`) and reset the stream.
-   - If `topic` is not in our subscriptions **and** not recently unsubscribed,
-     downscore. Maintain a small recently-unsubscribed LRU/TTL set keyed by
-     topic to honor the unsubscribe-race grace.
-   - Process frames in receive order (single reader goroutine per stream;
-     pushing onto the ordered `incoming` channel preserves ordering across
-     streams reasonably).
+   - `publish` → `topicScopedToMessage(ts, topic)` (reconstruct the full
+     `Message` with topic so the signature verifies, per the spec).
+   - `partial` → set `partial.TopicID = topic`.
+   Then hand the reconstructed content to the ingestion path described in §4.5.
 
-Stream close handling mirrors `handleNewStream`'s `incomingKindClosedStream`
-bookkeeping so per-peer/per-topic inbound counters are cleaned up.
+### 4.5 Inbound synchronization with the existing `incoming` kinds
 
-### 4.5 Routing changes
+> This addresses: *how does this synchronize with the existing `incomingUnion`
+> kinds, and what happens if the control stream is closed but we receive a
+> topic-stream RPC?*
 
-In `GossipSubRouter.rpcs` / `Publish` (`gossipsub.go`):
+**The single channel keeps things race-free, but only that.** Everything still
+funnels through the one `PubSub.incoming` channel, drained one item at a time by
+`processLoop`. So no matter how many topic streams a peer opens, there is never
+concurrent mutation of router state — that property is preserved for free. What
+the channel does **not** give us is cross-stream ordering: control stream and
+each topic stream are separate reader goroutines, so their sends interleave
+arbitrarily (only per-stream FIFO holds). The design must therefore be correct
+regardless of interleaving.
 
-- For each target peer `p` and the message's `topic`, if topic streams are
-  negotiated with `p` (`extensions.peerExtensions[p].TopicStreams &&
-  myExtensions.TopicStreams`), call `topicStreamManager.SendMessage(p, topic,
-  msg)` **instead of** `sendRPC` (control stream).
-- All other peers keep the existing `sendRPC` path.
-- Control messages and subscriptions are untouched — they always use the
-  control stream.
-- `IDONTWANT` semantics are preserved: IDONTWANT stays on the control stream;
-  the `unwanted` checks in `rpcs` continue to gate which messages are sent
-  (whether via control or topic stream).
+**Topic-stream messages must NOT reuse `incomingKindRPC` / `incomingKindNewStream`
+/ `incomingKindClosedStream` as-is.** Those kinds carry control-stream
+semantics that are wrong for topic streams:
+
+- `incomingKindClosedStream` → `onClosedIncomingStream` calls
+  `clearPeerFromTopicsState(pid)` (`pubsub.go`), which wipes **all** of the
+  peer's subscription state and emits `PeerLeave` events, and
+  `rt.OnClosedIncomingStream` deletes `peerExtensions[pid]`. Routing a *topic*
+  stream's close through this would tear down the peer's subscriptions and
+  extension state even though the control stream and other topic streams are
+  still alive.
+- `incomingKindRPC` → `handleIncomingRPC` processes subscriptions and calls
+  `rt.HandleRPC` → `extensions.HandleRPC`, whose "first RPC from this peer ⇒
+  treat as the extensions hello" branch (`extensions.go`) would misfire for a
+  reconstructed topic message — especially right after a control-stream close
+  cleared `peerExtensions[pid]`.
+
+**Design:** add one dedicated kind, `incomingKindTopicRPC`, carrying the
+reconstructed `*Message` (or a `Partial` + topic) and the source peer. In
+`processLoop` it routes to a slim ingestion path that does only what a
+topic-scoped message needs:
+
+- run `rt.AcceptFrom` (graylist/throttle vetting),
+- for a publish: the message half of `handleIncomingRPC` — our-own-subscription
+  check (`subscribedToMsg`/`canRelayMsg`), `shouldPush`, `Preprocess`,
+  `pushMsg` (validation, signature verify with topic present, forward),
+- for a partial: hand directly to `partialMessagesExtension.HandleRPC`.
+
+It deliberately skips subscription processing, the extensions-hello logic, and
+the generic `rt.HandleRPC`. Topic-stream open/close are handled **inside the
+transport layer** (counters + scoring callbacks, below), not via the router's
+incoming-stream notifications — so a topic stream closing never disturbs
+control-stream state, and vice versa.
+
+**So: control stream closed, then a topic-stream RPC arrives?** It is delivered
+correctly. Inbound publish delivery depends on *our* subscription
+(`subscribedToMsg`), not the peer's cleared state, and the slim path does not
+touch the now-cleared `peerExtensions`/`p.topics[...][peer]`. The reverse —
+control stream alive, a single topic stream closes — leaves subscriptions and
+other topic streams untouched because topic-stream lifecycle never flows through
+`onClosedIncomingStream`. (If the *connection* drops, all its streams — control
+and topic — fail together; the existing `handleDeadPeers` peer teardown plus the
+transport layer’s per-stream cleanup both run.)
+
+**Limits, scoring, ordering** (in the transport layer / via a score callback):
+
+- Track concurrent inbound streams per `(peer, topic)`; if > 3, downscore
+  (`reportMisbehavior`) and reset the offending stream.
+- If `topic` is not in our subscriptions **and** not recently unsubscribed,
+  downscore. Keep a small TTL set of recently-unsubscribed topics to honor the
+  unsubscribe-race grace the spec requires.
+- A single reader goroutine per stream preserves per-stream receive order; the
+  spec's "process multiple streams for a topic in receive order" is an explicit
+  open item (see §7) since the shared `incoming` channel only loosely orders
+  across streams.
 
 ### 4.6 Partial messages integration
 
-`partialMessageRouter.SendRPC` (`extensions.go`) becomes topic-aware: when topic
-streams are negotiated with the target peer, route the
-`PartialMessagesExtension` through `topicStreamManager.SendPartial(p, topicID,
-…)` (clearing `topicID` on the wire) rather than `gs.sendRPC(RPC{Partial})`.
-Inbound partials arriving on a topic stream get `topicID` repopulated from the
-header before being handed to `partialMessagesExtension.HandleRPC`.
+With the agnostic send path (§4.3), no extra wiring is needed:
+`partialMessageRouter.SendRPC` (`extensions.go`) keeps doing
+`gs.sendRPC(RPC{Partial: …})`, and the `comm.go` writer routes that `Partial`
+onto the topic stream (clearing `topicID` on the wire) just like a `Publish`.
+Inbound, the §4.4 handler repopulates `Partial.TopicID` from the header before
+the slim path hands it to `partialMessagesExtension.HandleRPC`.
 
 ### 4.7 Lifecycle, limits, scoring
 
-- **Open** lazily on first publish to a peer for a topic.
-- **Close** when: we observe the peer's unsubscribe for that topic (already
-  tracked in `handleIncomingRPC` via `p.topics`), when we leave/stop publishing
-  the topic (`Leave`), or when the peer leaves the mesh/fanout (optional
-  optimization: keep open only for mesh/fanout, short-lived for `IWANT`).
-- **Teardown** all topic streams to a peer on control-stream close
-  (`extensionsOnClosedOutboundStream`) and on blacklist.
+All outbound topic-stream lifecycle lives in the transport layer (§4.3); the
+router only emits intents the writer already sees.
+
+- **Open** lazily inside the writer on the first `Publish`/`Partial` for a
+  `(peer, topic)`.
+- **Close** when: the peer unsubscribes from the topic, when we leave/stop
+  publishing the topic, or when the peer leaves the mesh/fanout (optional
+  optimization: keep open only for mesh/fanout, short-lived for `IWANT`). The
+  unsubscribe/leave signals can be delivered to the writer via the same
+  per-peer `peerTransport` (e.g. a small command channel) so the router need
+  only continue calling `Leave`/processing unsubscribes as today.
+- **Teardown** all topic streams to a peer when the control stream / connection
+  drops (`extensionsOnClosedOutboundStream`, `handleDeadPeers`) and on
+  blacklist.
 - **Scoring** reuses `reportMisbehavior` / the score subsystem for: responder
   writing on a topic stream, > 3 concurrent inbound streams per topic, and
   unsubscribed-topic streams (outside the grace window).
@@ -329,16 +410,19 @@ header before being handed to `partialMessagesExtension.HandleRPC`.
 2. **Negotiation plumbing.** `PeerExtensions.TopicStreams`, `ExtendRPC`,
    `peerExtensionsFromRPC`, `WithTopicStreams`, activation hooks. Unit tests
    mirroring the extension/feature tests.
-3. **Outbound `topicStreamManager`.** Stream open + header + writer goroutine +
-   responder-write guard + lifecycle/close. Owned-state concurrency.
-4. **Inbound `/gsts/v0beta` handler.** Header state machine, message
-   reconstruction, push onto `incoming`, per-topic limits + downscoring +
+3. **Outbound transparent multiplexing (`comm.go`).** Per-peer stream set,
+   lazy `/gsts/v0beta` open + header, writer splits `Publish`/`Partial` onto
+   topic streams vs control traffic on the control stream, responder-write
+   guard, `peerTransport` + atomic negotiation flag set from
+   `extensionsOnNewOutboundStream`. **No changes to `gossipsub.go` routing.**
+4. **Inbound `/gsts/v0beta` handler + `incomingKindTopicRPC`.** Header state
+   machine, message/partial reconstruction, slim ingestion path that skips
+   subscription + extensions-hello logic, per-topic limits + downscoring +
    unsubscribe grace.
-5. **Routing split.** `rpcs`/`Publish` send via topic streams for negotiated
-   peers; verify control stream no longer carries `Message`.
-6. **Partial-messages integration.** Topic-aware `SendRPC`; inbound `topicID`
-   repopulation.
-7. **Lifecycle polish + scoring.** Mesh/fanout-only retention, short-lived
+5. **Verify the split.** Confirm the control stream no longer carries `Message`
+   for negotiated peers and that all existing routing tests still pass
+   unchanged (since the router is untouched).
+6. **Lifecycle polish + scoring.** Mesh/fanout-only retention, short-lived
    `IWANT` streams, score penalties, resource caps.
 8. **Tests + docs.** Integration tests, backwards-compat, and a short
    `README`/doc note. Optionally update `extensions/extensions.proto` registry
@@ -373,15 +457,19 @@ header before being handed to `partialMessagesExtension.HandleRPC`.
 
 ## 7. Risks & open questions
 
-- **Biggest risk:** the per-`(peer, topic)` outbound stream model is a
-  structural change to a codebase that assumes one queue per peer
-  (`PubSub.peers`). Concurrency between writer goroutines and the
-  single-threaded `processLoop`/`eval` must be carefully bounded.
+- **Biggest risk:** introducing per-`(peer, topic)` streams into a send path
+  that assumes one stream/queue per peer (`PubSub.peers`). Keeping the router
+  agnostic (§4.3) contains the change to `comm.go`, but the writer now owns
+  multiple streams and a negotiation flag shared with the eval thread — that
+  hand-off must stay simple (single atomic, set once).
+- **Cross-stream ordering / synchronization:** the single `incoming` channel
+  prevents data races but gives no ordering between the control stream and topic
+  streams (e.g. a control GRAFT vs a topic publish may reorder). This is
+  acceptable per the spec's intent (decoupling topics) but must be validated;
+  the "process multiple streams per topic in receive order" SHOULD is an open
+  item that may need per-`(peer, topic)` sequencing.
 - **Resource usage:** many topics ⇒ many streams; need caps and resource-
   manager awareness; revisit `peerOutboundQueueSize` semantics per topic.
-- **Ordering:** spec says receivers SHOULD process multiple streams for a topic
-  in receive order — confirm the single `incoming` channel preserves adequate
-  ordering, or add per-topic sequencing.
 - **`/gsts/v0beta` is experimental/beta** — protocol id and field number
   (`6492435`) are not final; keep them isolated/configurable.
 - **Interaction with message batching** (`messagebatch.go`) and IDONTWANT — map
@@ -393,10 +481,16 @@ header before being handed to `partialMessagesExtension.HandleRPC`.
 
 ## 8. Environment notes
 
-- The module requires **Go 1.25** (`go.mod`), but this VM currently has Go
-  1.22.2 and the 1.25 toolchain auto-download fails ("toolchain not
-  available"). Building/testing the implementation requires provisioning Go
-  1.25.
-- Regenerating `pb/rpc.pb.go` requires `protoc` + `protoc-gen-go`, which are
-  not installed here. These should be added to the cloud-agent environment
-  before implementation begins.
+The build/codegen toolchain has been provisioned on this VM and verified
+(`go build ./...` and `make -C pb clean && make -C pb` both succeed, with the
+regenerated `pb/*.pb.go` byte-identical to what is committed):
+
+- **Go 1.25.11** at `/usr/local/go` (the module requires Go ≥ 1.25; the image's
+  default Go 1.22.2 could not auto-download the toolchain).
+- **protoc 34.1** — its reported compiler version (`v7.34.1`) matches the header
+  in the committed generated files.
+- **protoc-gen-go v1.36.6** — matches the committed generator version.
+
+These installs live only in the current VM; to make them permanent for future
+Cloud Agents, update the cloud-agent environment config (e.g. via an env-setup
+agent) to install the same versions and put them on `PATH`.
