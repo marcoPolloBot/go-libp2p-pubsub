@@ -398,7 +398,10 @@ func (rpc *RPC) split(limit, controlLimit int) iter.Seq[*RPC] {
 			// Restore the original message before returning
 			rpc.Publish = originalPublishSlice
 		}()
-		if s := proto.Size(&rpc.RPC); s <= limit && controlRPCSize(rpc) <= controlLimit {
+		// The uncached proto.Size call refreshes the cached sizes of the
+		// Subscriptions and Control sub-messages, so reusing them right after
+		// is safe.
+		if s := proto.Size(&rpc.RPC); s <= limit && controlRPCSizeWithOpts(rpc, cachedSizeOpts) <= controlLimit {
 			if s != 0 {
 				nextRPC = &RPC{from: rpc.from}
 				proto.Merge(&nextRPC.RPC, &rpc.RPC)
@@ -564,26 +567,42 @@ func (rpc *RPC) split(limit, controlLimit int) iter.Seq[*RPC] {
 	}
 }
 
+// cachedSizeOpts computes protobuf sizes by reusing the sizes memoized by an
+// earlier Size call. Per the UseCachedSize contract, it is only safe to use on
+// a message that Size has been called on and that (including its sub-messages)
+// has not been mutated since.
+var cachedSizeOpts = proto.MarshalOptions{UseCachedSize: true}
+
 func (rpc *RPC) exceedsSizeLimits(limit, controlLimit int) bool {
-	return proto.Size(&rpc.RPC) > limit || controlRPCSize(rpc) > controlLimit
+	if proto.Size(&rpc.RPC) > limit {
+		return true
+	}
+	// The proto.Size call above memoized the size of every sub-message it
+	// visited, and nothing has mutated since, so the Subscriptions and Control
+	// sub-messages can be sized from the cache.
+	return controlRPCSizeWithOpts(rpc, cachedSizeOpts) > controlLimit
 }
 
 func controlRPCSize(rpc *RPC) int {
+	return controlRPCSizeWithOpts(rpc, proto.MarshalOptions{})
+}
+
+func controlRPCSizeWithOpts(rpc *RPC, opts proto.MarshalOptions) int {
 	if rpc == nil {
 		return 0
 	}
 	// Compute the encoded size of an RPC containing only the Subscriptions and
-	// Control fields, without allocating a temporary pb.RPC. Calling proto.Size
+	// Control fields, without allocating a temporary pb.RPC. Calling Size
 	// on the existing sub-message pointers doesn't allocate, whereas building a
 	// throwaway pb.RPC{Subscriptions, Control} escapes to the heap.
 	var size int
 	// Subscriptions are field 1 in pb.RPC (field number < 16).
 	for _, sub := range rpc.Subscriptions {
-		size += pbFieldNumberLT15Size + sizeOfEmbeddedMsg(proto.Size(sub))
+		size += pbFieldNumberLT15Size + sizeOfEmbeddedMsg(opts.Size(sub))
 	}
 	// Control is field 3 in pb.RPC (field number < 16).
 	if rpc.Control != nil {
-		size += pbFieldNumberLT15Size + sizeOfEmbeddedMsg(proto.Size(rpc.Control))
+		size += pbFieldNumberLT15Size + sizeOfEmbeddedMsg(opts.Size(rpc.Control))
 	}
 	return size
 }
