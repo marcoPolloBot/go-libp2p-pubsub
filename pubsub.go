@@ -26,6 +26,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// cachedProtoSizeOpts reads sizes populated by a prior proto.Size call.
+// Only use this for immutable sub-messages, never for RPC wrappers that are
+// mutated during split.
+var cachedProtoSizeOpts = proto.MarshalOptions{UseCachedSize: true}
+
 const (
 	// DefaultMaximumMessageSize is 1MiB.
 	DefaultMaxMessageSize = 1 << 20
@@ -348,6 +353,10 @@ func (rpc *RPC) LogValue() slog.Value {
 // oversized RPCs.
 func (rpc *RPC) split(limit, controlLimit int) iter.Seq[*RPC] {
 	return func(yield func(*RPC) bool) {
+		// Populate size caches for immutable sub-messages. Do not use cached
+		// sizes on the RPC itself since we mutate it during split.
+		proto.Size(&rpc.RPC)
+
 		nextRPC := &RPC{from: rpc.from}
 
 		{
@@ -361,7 +370,7 @@ func (rpc *RPC) split(limit, controlLimit int) iter.Seq[*RPC] {
 			// splitting a message.
 			for _, msg := range rpc.Publish {
 				// We know the message field number is <15 so this is safe.
-				incrementalSize := pbFieldNumberLT15Size + sizeOfEmbeddedMsg(proto.Size(msg))
+				incrementalSize := pbFieldNumberLT15Size + sizeOfEmbeddedMsg(cachedProtoSizeOpts.Size(msg))
 				if nextRPCSize+incrementalSize > limit {
 					// The message doesn't fit. Let's set the messages that did fit
 					// into this RPC, yield it, then make a new one
@@ -579,7 +588,7 @@ func controlRPCSize(rpc *RPC) int {
 	var size int
 	// Subscriptions are field 1 in pb.RPC (field number < 16).
 	for _, sub := range rpc.Subscriptions {
-		size += pbFieldNumberLT15Size + sizeOfEmbeddedMsg(proto.Size(sub))
+		size += pbFieldNumberLT15Size + sizeOfEmbeddedMsg(cachedProtoSizeOpts.Size(sub))
 	}
 	// Control is field 3 in pb.RPC (field number < 16).
 	if rpc.Control != nil {
